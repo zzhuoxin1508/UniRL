@@ -41,6 +41,7 @@ update shares the same PPO anchor; this is only correct for algorithms with
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Dict, List, Mapping, Optional, Tuple
 
@@ -345,10 +346,27 @@ class TrainStack(Remote):
             num_updates=self.num_updates_per_batch,
             micro_batch_size=self.micro_batch_size,
         )
-        self.prepare_segment(resp_track, plans=plans)
-        result = self._run_updates(resp_track, plans=plans, training_progress=float(training_progress))
+        # Opt-in profiler (UNIRL_PROFILE=1): wraps ONLY the train compute
+        # (anchor-freeze forward + the N optimizer-step updates) — the rollout ran
+        # in the engine phase before this call, so this region is the pure train step.
+        profiler = self._train_step_profiler()
+        with profiler.record("train_track") if profiler is not None else nullcontext():
+            self.prepare_segment(resp_track, plans=plans)
+            result = self._run_updates(resp_track, plans=plans, training_progress=float(training_progress))
+        if profiler is not None:
+            profiler.step()
         self.on_rollout_end()
         return result
+
+    def _train_step_profiler(self):
+        """Lazily build the per-worker train-step profiler (None unless UNIRL_PROFILE)."""
+        cached = getattr(self, "_profiler_cache", "unset")
+        if cached == "unset":
+            from unirl.utils.profiling import maybe_build_train_profiler
+
+            cached = maybe_build_train_profiler(int(getattr(self.fsdp_backend, "_rank", 0)))
+            self._profiler_cache = cached
+        return cached
 
     def _run_updates(
         self,
