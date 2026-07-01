@@ -26,6 +26,7 @@ optimizer step, in contrast to the single-stage ``TrainStack``.
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from typing import Dict, List, Mapping
 
 from unirl.algorithms import AlgorithmStepResult, StageAlgorithm
@@ -146,6 +147,16 @@ class UnifiedModelTrainStack(Remote):
         """Per-rollout-boundary hook — delegates to the FSDPBackend's EMA."""
         self.fsdp_backend.on_rollout_end()
 
+    def _train_step_profiler(self):
+        """Lazily build the per-worker train-step profiler (None unless UNIRL_PROFILE)."""
+        cached = getattr(self, "_profiler_cache", "unset")
+        if cached == "unset":
+            from unirl.utils.profiling import maybe_build_train_profiler
+
+            cached = maybe_build_train_profiler(int(getattr(self.fsdp_backend, "_rank", 0)))
+            self._profiler_cache = cached
+        return cached
+
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def train_track(
         self,
@@ -173,26 +184,33 @@ class UnifiedModelTrainStack(Remote):
         ar_track = ar_track.to_device(device)
         image_track = image_track.to_device(device)
 
-        tracks = {"ar": ar_track, "image": image_track}
-        for name in self.algorithms:
-            self.prepare_segment(name, tracks[name])
+        # Opt-in profiler (UNIRL_PROFILE=1): wraps ONLY the train compute
+        # (both algorithms' backward + the single optimizer step) — the rollout ran
+        # in the engine phase before this call, so this region is the pure train step.
+        profiler = self._train_step_profiler()
+        with profiler.record("train_track") if profiler is not None else nullcontext():
+            tracks = {"ar": ar_track, "image": image_track}
+            for name in self.algorithms:
+                self.prepare_segment(name, tracks[name])
 
-        self.fsdp_backend.zero_grad()
+            self.fsdp_backend.zero_grad()
 
-        results: Dict[str, TrainStepResult] = {}
-        any_backward = False
-        for name in self.algorithms:
-            partial, has_backward = self._train_one(name, tracks[name], training_progress=float(training_progress))
-            results[name] = partial
-            any_backward = any_backward or has_backward
+            results: Dict[str, TrainStepResult] = {}
+            any_backward = False
+            for name in self.algorithms:
+                partial, has_backward = self._train_one(name, tracks[name], training_progress=float(training_progress))
+                results[name] = partial
+                any_backward = any_backward or has_backward
 
-        if any_backward:
-            grad_norm = float(self.fsdp_backend.optimizer_step(max_grad_norm=float(self.max_grad_norm)))
-        else:
-            grad_norm = 0.0
-            logger.warning(
-                "UnifiedModelTrainStack.train_track: no algorithm reported backward; skipping optimizer step."
-            )
+            if any_backward:
+                grad_norm = float(self.fsdp_backend.optimizer_step(max_grad_norm=float(self.max_grad_norm)))
+            else:
+                grad_norm = 0.0
+                logger.warning(
+                    "UnifiedModelTrainStack.train_track: no algorithm reported backward; skipping optimizer step."
+                )
+        if profiler is not None:
+            profiler.step()
 
         self.on_rollout_end()
 

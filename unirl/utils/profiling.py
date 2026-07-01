@@ -101,6 +101,14 @@ def maybe_build_train_profiler(rank: int) -> Optional[TrainStepProfiler]:
     """
     if not _truthy(os.environ.get("UNIRL_PROFILE")):
         return None
+    # The caller passes a backend-specific rank that is 0 on every worker for some
+    # backends (e.g. FSDP colocate lacks `_rank`). Prefer the true global rank from
+    # the process group so UNIRL_PROFILE_RANKS actually restricts to one worker —
+    # profiling every rank makes 8 CUPTI trace-flushes contend and stall the export.
+    import torch.distributed as dist
+
+    if dist.is_available() and dist.is_initialized():
+        rank = dist.get_rank()
     if not _rank_enabled(int(rank)):
         return None
 
@@ -112,7 +120,11 @@ def maybe_build_train_profiler(rank: int) -> Optional[TrainStepProfiler]:
     os.makedirs(out_dir, exist_ok=True)
 
     activities = [torch.profiler.ProfilerActivity.CPU]
-    if torch.cuda.is_available():
+    # CUDA (CUPTI) activity can be disabled with UNIRL_PROFILE_CUDA=0. On some
+    # torch/driver/CUPTI combos the CUDA kineto trace-finalize (stop_trace) hangs
+    # the export; a CPU-only trace still opens in Perfetto and shows the step
+    # structure + cudaLaunchKernel timeline.
+    if _truthy(os.environ.get("UNIRL_PROFILE_CUDA"), default=True) and torch.cuda.is_available():
         activities.append(torch.profiler.ProfilerActivity.CUDA)
 
     sched = torch.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=repeat)
@@ -137,4 +149,57 @@ def maybe_build_train_profiler(rank: int) -> Optional[TrainStepProfiler]:
     return TrainStepProfiler(prof, total_steps=total, out_dir=out_dir)
 
 
-__all__ = ["TrainStepProfiler", "maybe_build_train_profiler"]
+@contextmanager
+def maybe_profile_update(owner, rank: int) -> Iterator[None]:
+    """One-shot profiler around a SINGLE ``_run_update`` (``UNIRL_PROFILE_SCOPE=update``).
+
+    torch.profiler records continuously while active, so the schedule-based
+    :class:`TrainStepProfiler` (which spans a whole rollout) always sweeps in the big
+    SDE-replay ``prepare_segment`` too. For compute/comm OVERLAP analysis we want just
+    one optimizer update — backward + FSDP reduce-scatter/all-gather + optimizer_step.
+    This wraps exactly that region in its own profiler and exports immediately, so the
+    trace is small and contains only the overlap-relevant window.
+
+    Fires once, on rank0 (true global rank), after skipping ``UNIRL_PROFILE_WARMUP``
+    updates (default 2) so the profiled step is past first-iter compile/allocation.
+    A no-op context otherwise.
+    """
+    enabled = _truthy(os.environ.get("UNIRL_PROFILE"))
+    if enabled:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            rank = dist.get_rank()
+        enabled = _rank_enabled(int(rank))
+
+    n = getattr(owner, "_prof_update_seen", 0)
+    owner._prof_update_seen = n + 1
+    skip = _int_env("UNIRL_PROFILE_WARMUP", 2)
+    if not enabled or getattr(owner, "_prof_update_done", False) or n != skip:
+        yield
+        return
+
+    out_dir = os.environ.get("UNIRL_PROFILE_DIR", "outputs/profiler").strip() or "outputs/profiler"
+    os.makedirs(out_dir, exist_ok=True)
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if _truthy(os.environ.get("UNIRL_PROFILE_CUDA"), default=True) and torch.cuda.is_available():
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+    prof = torch.profiler.profile(
+        activities=activities,
+        record_shapes=_truthy(os.environ.get("UNIRL_PROFILE_SHAPES"), default=False),
+        profile_memory=_truthy(os.environ.get("UNIRL_PROFILE_MEMORY"), default=False),
+        with_stack=_truthy(os.environ.get("UNIRL_PROFILE_STACK"), default=False),
+    )
+    logger.info("maybe_profile_update[rank%d]: profiling one optimizer update -> %s", int(rank), out_dir)
+    prof.start()
+    try:
+        yield
+    finally:
+        prof.stop()
+        owner._prof_update_done = True
+        out = os.path.join(out_dir, f"update_rank{int(rank)}.pt.trace.json")
+        prof.export_chrome_trace(out)
+        logger.info("maybe_profile_update[rank%d]: trace written to %s", int(rank), out)
+
+
+__all__ = ["TrainStepProfiler", "maybe_build_train_profiler", "maybe_profile_update"]
